@@ -1,5 +1,10 @@
 # Define base image.
-FROM nvidia/cudagl:11.3.1-devel
+# FROM sdfstudio-base:11.8.0-devel-ubuntu22.04
+FROM nvidia/cuda:11.8.0-devel-ubuntu22.04
+
+ARG username
+ARG uid
+ARG gid
 
 # Set environment variables.
 ## Set non-interactive to prevent asking for user inputs blocking image creation.
@@ -7,7 +12,8 @@ ENV DEBIAN_FRONTEND=noninteractive
 ## Set timezone as it is required by some packages.
 ENV TZ=Europe/Berlin
 ## CUDA architectures, required by tiny-cuda-nn.
-ENV TCNN_CUDA_ARCHITECTURES=86
+ARG MY_GPU_ARCH=86
+ENV TCNN_CUDA_ARCHITECTURES=${MY_GPU_ARCH}
 ## CUDA Home, required to find CUDA in some packages.
 ENV CUDA_HOME="/usr/local/cuda"
 
@@ -36,78 +42,74 @@ RUN apt-get update && \
     libsuitesparse-dev \
     nano \
     protobuf-compiler \
-    python3.8-dev \
+    python3-dev \
     python3-pip \
     qtbase5-dev \
     wget
 
-# Install GLOG (required by ceres).
-RUN git clone --branch v0.6.0 https://github.com/google/glog.git --single-branch && \
-    cd glog && \
-    mkdir build && \
-    cd build && \
-    cmake .. && \
-    make -j && \
-    make install && \
-    cd ../.. && \
-    rm -r glog
-# Add glog path to LD_LIBRARY_PATH.
-ENV LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/usr/local/lib"
-
-# Install Ceres-solver (required by colmap).
-RUN git clone --branch 2.1.0 https://ceres-solver.googlesource.com/ceres-solver.git --single-branch && \
-    cd ceres-solver && \
-    git checkout $(git describe --tags) && \
-    mkdir build && \
-    cd build && \
-    cmake .. -DBUILD_TESTING=OFF -DBUILD_EXAMPLES=OFF && \
-    make -j && \
-    make install && \
-    cd ../.. && \
-    rm -r ceres-solver
-
 # Install colmap.
-RUN git clone --branch 3.7 https://github.com/colmap/colmap.git --single-branch && \
+## use CUDA 11.8 or specify GPU uarch via CMAKE_CUDA_ARCHITECTURES
+## from https://colmap.github.io/install.html
+## if not specified, will build arch from 35 to 86 + PTX
+## but 35 is not supported anymore after CUDA 12.0
+## add: build will fail in cuda 12
+RUN apt-get update && apt-get install -y \
+    ninja-build \
+    libflann-dev \
+    libgtest-dev \
+    libsqlite3-dev \
+    libceres-dev
+
+RUN git clone --branch 3.8 https://github.com/colmap/colmap.git --single-branch && \
     cd colmap && \
     mkdir build && \
     cd build && \
-    cmake .. && \
-    make -j && \
-    make install && \
-    cd ../.. && \
-    rm -r colmap
+    cmake .. -GNinja -DCMAKE_CUDA_ARCHITECTURES=${MY_GPU_ARCH} && \
+    ninja && \
+    ninja install && \
+    cd ../.. && rm -rf colmap
     
 # Create non root user and setup environment.
-RUN useradd -m -d /home/user -u 1000 user
+## The user has exactly the same uid:gid as builder
+## which allows read/write to mounted volumn
+RUN groupadd -g ${gid} -o ${username}
+RUN useradd -m -d /home/${username} -u ${uid} -g ${gid} -o ${username}
 
 # Switch to new uer and workdir.
-USER 1000:1000
-WORKDIR /home/user
+USER ${username}
+WORKDIR /home/${username}
 
 # Add local user binary folder to PATH variable.
-ENV PATH="${PATH}:/home/user/.local/bin"
+ENV PATH="${PATH}:/home/${username}/.local/bin"
 SHELL ["/bin/bash", "-c"]
 
 # Upgrade pip and install packages.
-RUN python3.8 -m pip install --upgrade pip setuptools pathtools promise
+RUN python3 -m pip install --upgrade pip setuptools pathtools promise
 # Install pytorch and submodules.
-RUN python3.8 -m pip install torch==1.12.1+cu113 torchvision==0.13.1+cu113 torchaudio==0.12.1 --extra-index-url https://download.pytorch.org/whl/cu113
+RUN python3 -m pip install torch==1.12.1+cu113 torchvision==0.13.1+cu113 torchaudio==0.12.1 --extra-index-url https://download.pytorch.org/whl/cu113
 # Install tynyCUDNN.
-RUN python3.8 -m pip install git+https://github.com/NVlabs/tiny-cuda-nn.git#subdirectory=bindings/torch
+RUN python3 -m pip install git+https://github.com/NVlabs/tiny-cuda-nn.git#subdirectory=bindings/torch
 
 # Copy nerfstudio folder and give ownership to user.
-ADD . /home/user/nerfstudio
+ADD . /home/${username}/nerfstudio
 USER root
-RUN chown -R user:user /home/user/nerfstudio
-USER 1000:1000
+RUN chown -R ${uid}:${gid} /home/${username}/nerfstudio && usermod -aG sudo ${username}
+USER ${username}
 
 # Install nerfstudio dependencies.
 RUN cd nerfstudio && \
-    python3.8 -m pip install -e . && \
+    python3 -m pip install -e . && \
     cd ..
 
 # Change working directory
 WORKDIR /workspace
+
+## Additional missing packages
+USER root
+RUN apt-get update && apt-get install -y \
+    curl
+USER ${username}
+
 
 # Install nerfstudio cli auto completion and enter shell if no command was provided.
 CMD ns-install-cli --mode install && /bin/bash
